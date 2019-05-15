@@ -25,6 +25,7 @@ import Hedgehog
   , Property
   , PropertyName
   , PropertyT
+  , annotate
   , assert
   , checkParallel
   , checkSequential
@@ -83,6 +84,16 @@ tests scenario = do
       ContinuousIntegration -> identity
       Development           -> take 15
       QualityAssurance      -> identity
+    shouldAssertNF :: Bool
+    shouldAssertNF = case scenario of
+      -- In our 'ContinuousIntegration' builds, we utilize 'hpc' for providing
+      -- code coverage. 'hpc' appears to introduce thunks around our Haskell
+      -- expressions for its program coverage measurement purposes which
+      -- prevents us from accurately determining whether a given expression is
+      -- in normal form. As a result, we will just disable this assertion when
+      -- running tests under the 'ContinuousIntegration' 'TestScenario'.
+      ContinuousIntegration -> False
+      _                     -> True
 
   -- Get a list of epoch files to perform validation on
   files <- takeFiles <$> mainnetEpochFiles
@@ -93,7 +104,7 @@ tests scenario = do
     properties :: [(PropertyName, Property)]
     properties = zip
       (fromString . takeFileName <$> files)
-      (epochValid config cvsRef <$> files)
+      (epochValid config cvsRef shouldAssertNF <$> files)
   (&&)
     <$> checkSequential (Group "Test.Cardano.Chain.Block.Validation" properties)
     <*> checkParallel $$discover
@@ -106,15 +117,28 @@ data Error
 
 -- | Check that a single epoch's 'Block's are valid by folding over them
 epochValid
-  :: Genesis.Config -> IORef ChainValidationState -> FilePath -> Property
-epochValid config cvsRef fp = withTests 1 . property $ do
+  :: Genesis.Config
+  -> IORef ChainValidationState
+  -> Bool
+  -> FilePath
+  -> Property
+epochValid config cvsRef shouldAssertNF fp = withTests 1 . property $ do
   cvs <- liftIO $ readIORef cvsRef
   let stream = parseEpochFileWithBoundary (configEpochSlots config) fp
   result <- (liftIO . runResourceT . runExceptT)
     (foldChainValidationState config cvs stream)
   newCvs <- evalEither result
-  newCvsIsNF <- liftIO $ isNormalForm $! newCvs
-  assert newCvsIsNF
+  case shouldAssertNF of
+    True -> do
+      newCvsIsNF <- liftIO $ isNormalForm $! newCvs
+      annotate ("Did you build with `ghc -fhpc` or `stack --coverage`?\n"
+        <> "If so, please be aware that hpc will introduce thunks around "
+        <> "expressions for its program coverage measurement purposes and "
+        <> "this assertion can fail as a result.\n"
+        <> "Otherwise, for some reason, the `ChainValidationState` is not in "
+        <> "normal form.")
+      assert newCvsIsNF
+    False -> pass
   liftIO $ writeIORef cvsRef newCvs
 
 
